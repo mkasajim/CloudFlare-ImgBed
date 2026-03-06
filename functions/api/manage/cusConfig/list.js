@@ -1,5 +1,21 @@
 import { readIndex } from "../../../utils/indexManager";
 
+function normalizeAddress(address) {
+    if (!address) return 'Unknown';
+
+    const countryMap = {
+        '孟加拉国': 'Bangladesh',
+        '中国': 'China',
+        '未知': 'Unknown',
+    };
+
+    let normalized = address;
+    for (const [cn, en] of Object.entries(countryMap)) {
+        normalized = normalized.split(cn).join(en);
+    }
+    return normalized;
+}
+
 export async function onRequest(context) {
     // Contents of context object
     const {
@@ -54,10 +70,9 @@ async function dealByIP(data) {
     ipSet.forEach(async ip => {
         let ipData = data.filter(item => item.metadata?.UploadIP === ip);
         let count = ipData.length;
-        let address = ipData[0].metadata?.UploadAddress || '未知';
+        let address = normalizeAddress(ipData[0].metadata?.UploadAddress || 'Unknown');
         dealedData.push({ip, address, count, data: ipData});
     });
 
     return dealedData;
 }
-
