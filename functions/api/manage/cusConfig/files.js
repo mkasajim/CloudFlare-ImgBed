@@ -1,4 +1,4 @@
-import { readIndex } from "../../../utils/indexManager";
+import { listFilesByUploadIP } from "../../../utils/indexManager";
 import { getDatabase } from "../../../utils/databaseAdapter.js";
 import { buildFileMetadataForManagement, createMetadataViewContext } from "../../../utils/metadata/metadataView.js";
 
@@ -21,21 +21,18 @@ export async function onRequest(context) {
 
     const db = getDatabase(context.env);
     const metadataViewContext = await createMetadataViewContext(db, context.env);
-    const allRecords = await readIndex(context, { count: -1, includeSubdirFiles: true });
-    const matchingFiles = allRecords.files
-        .filter(item => item.metadata?.UploadIP === ip)
-        .map(item => ({
-            ...item,
-            metadata: item.metadata
-        }));
-    const files = await Promise.all(matchingFiles.map(async item => ({
+
+    // 按上传 IP 查询文件（D1 后端走 SQL 分页，KV 后端走索引过滤）
+    const { files, total } = await listFilesByUploadIP(context, ip, start, count);
+
+    const data = await Promise.all(files.map(async item => ({
         ...item,
         metadata: await buildFileMetadataForManagement(db, context.env, item.metadata, metadataViewContext)
     })));
 
     return new Response(JSON.stringify({
-        data: files.slice(start, start + count),
-        total: files.length,
+        data,
+        total,
     }), {
         headers: { "Content-Type": "application/json" }
     });

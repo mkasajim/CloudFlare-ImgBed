@@ -1,5 +1,5 @@
 import { fetchOthersConfig } from "../utils/sysConfig";
-import { readIndex } from "../utils/indexManager";
+import { queryRandomFile } from "../utils/indexManager";
 import { detectDevice, resolveOrientation, addClientHintsHeaders } from "./adaptive.js";
 
 // CORS 跨域响应头
@@ -89,39 +89,12 @@ export async function onRequest(context) {
         return new Response(JSON.stringify({ error: "Directory not allowed" }), { status: 403, headers: corsHeaders });
     }
 
-    // 调用randomFileList接口，读取KV数据库中的所有记录
-    let allRecords = await getRandomFileList(context, requestUrl, dir);
+    // 直接通过数据库查询随机文件（D1 后端走 SQL 随机选取，KV 后端走索引过滤）
+    let randomKey = await queryRandomFile(context, { directory: dir, fileTypes: fileType, orientation });
 
-    // 筛选出符合fileType要求的记录
-    allRecords = allRecords.filter(item => { return fileType.some(type => item.FileType?.includes(type)) });
-
-    // 保存过滤前的记录，用于自适应模式降级
-    const allRecordsBeforeOrientationFilter = allRecords;
-
-    // 根据图片方向筛选
-    if (orientation && allRecords.length > 0) {
-        const SQUARE_THRESHOLD = 0.1; // 宽高比差异小于10%视为方图
-        allRecords = allRecords.filter(item => {
-            // 如果没有尺寸信息，跳过该记录
-            if (!item.Width || !item.Height) return false;
-
-            const ratio = item.Width / item.Height;
-            switch (orientation) {
-                case 'landscape': // 横图：宽 > 高
-                    return ratio > (1 + SQUARE_THRESHOLD);
-                case 'portrait': // 竖图：高 > 宽
-                    return ratio < (1 - SQUARE_THRESHOLD);
-                case 'square': // 方图：宽 ≈ 高
-                    return ratio >= (1 - SQUARE_THRESHOLD) && ratio <= (1 + SQUARE_THRESHOLD);
-                default:
-                    return true;
-            }
-        });
-    }
-
-    // 自适应模式降级：过滤后无匹配图片时，降级到全部图片
-    if (isAutoMode && orientation && allRecords.length === 0) {
-        allRecords = allRecordsBeforeOrientationFilter;
+    // 自适应模式降级：带方向过滤无匹配图片时，降级到全部图片
+    if (!randomKey && isAutoMode && orientation) {
+        randomKey = await queryRandomFile(context, { directory: dir, fileTypes: fileType, orientation: '' });
     }
 
     // 构建响应头：添加 CORS 跨域响应头，自适应模式下添加 Client Hints 协商头
@@ -130,11 +103,9 @@ export async function onRequest(context) {
         addClientHintsHeaders(responseHeaders);
     }
 
-    if (allRecords.length == 0) {
+    if (randomKey == null) {
         return new Response(JSON.stringify({}), { status: 200, headers: responseHeaders });
     } else {
-        const randomIndex = Math.floor(Math.random() * allRecords.length);
-        const randomKey = allRecords[randomIndex];
         const randomPath = '/file/' + randomKey.name;
         let randomUrl = randomPath;
 
@@ -170,36 +141,4 @@ export async function onRequest(context) {
             return new Response(JSON.stringify({ url: randomUrl }), { status: 200, headers: responseHeaders });
         }
     }
-}
-
-async function getRandomFileList(context, url, dir) {
-    // 检查缓存中是否有记录，有则直接返回
-    const cache = caches.default;
-    const cacheRes = await cache.match(`${url.origin}/api/randomFileList?dir=${dir}`);
-    if (cacheRes) {
-        return JSON.parse(await cacheRes.text());
-    }
-
-    let allRecords = await readIndex(context, { directory: dir, count: -1, includeSubdirFiles: true, accessStatus: 'normal' });
-
-    // 仅保留记录的name和metadata中的必要字段
-    allRecords = allRecords.files?.map(item => {
-        return {
-            name: item.id,
-            FileType: item.metadata?.FileType,
-            Width: item.metadata?.Width,
-            Height: item.metadata?.Height
-        }
-    });
-
-    // 缓存结果，缓存时间为24小时
-    await cache.put(`${url.origin}/api/randomFileList?dir=${dir}`, new Response(JSON.stringify(allRecords), {
-        headers: {
-            "Content-Type": "application/json",
-        }
-    }), {
-        expirationTtl: 24 * 60 * 60
-    });
-    
-    return allRecords;
 }

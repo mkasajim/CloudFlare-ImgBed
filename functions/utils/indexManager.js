@@ -58,6 +58,551 @@ export function getIndexChunkSize(env) {
     return config.usingD1 ? INDEX_CHUNK_SIZE_D1 : INDEX_CHUNK_SIZE_KV;
 }
 
+/* ============= D1 SQL 直查模式 ============= */
+/**
+ * 当后端为 D1 数据库时，文件列表/统计不再依赖 JSON 分块索引，
+ * 而是直接通过 SQL 查询 files 表（表内已有 timestamp/directory/channel 等索引列）。
+ * 这样可以避免在请求内解析数十 MB 的索引 JSON，突破 CPU 时间限制。
+ */
+
+// 基础过滤条件：跳过无时间戳的记录和分片临时记录（与原索引构建时的跳过规则一致）
+const D1_BASE_FILE_FILTER = "timestamp IS NOT NULL AND substr(id, 1, 6) <> 'chunk_'";
+
+function isD1Backend(context) {
+    return checkDatabaseConfig(context.env).usingD1;
+}
+
+function escapeLike(value) {
+    return String(value).replace(/[\\%_]/g, (m) => '\\' + m);
+}
+
+function parseMetadata(metadataStr) {
+    if (!metadataStr) return {};
+    try {
+        const parsed = JSON.parse(metadataStr);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+async function d1All(context, sql, params = []) {
+    const adapter = getDatabase(context.env);
+    let stmt = adapter.db.prepare(sql);
+    if (params.length > 0) {
+        stmt = stmt.bind(...params);
+    }
+    const response = await stmt.all();
+    return response.results || [];
+}
+
+async function d1First(context, sql, params = []) {
+    const adapter = getDatabase(context.env);
+    let stmt = adapter.db.prepare(sql);
+    if (params.length > 0) {
+        stmt = stmt.bind(...params);
+    }
+    return await stmt.first();
+}
+
+async function d1Run(context, sql, params = []) {
+    const adapter = getDatabase(context.env);
+    let stmt = adapter.db.prepare(sql);
+    if (params.length > 0) {
+        stmt = stmt.bind(...params);
+    }
+    await stmt.run();
+}
+
+/**
+ * 构建与原索引 readIndex 过滤语义一致的 SQL 条件
+ * @param {Object} options - 已归一化为数组的过滤选项
+ * @returns {{where: string, params: Array}} SQL WHERE 片段与绑定参数
+ */
+function buildD1FileFilter(options = {}) {
+    const {
+        search = '',
+        channel = [],
+        listType = [],
+        accessStatus = [],
+        label = [],
+        fileType = [],
+        channelName = [],
+        includeTags = [],
+        excludeTags = [],
+    } = options;
+
+    const params = [];
+    const conditions = [D1_BASE_FILE_FILTER];
+
+    // 关键字搜索（文件名或文件ID，大小写不敏感）
+    if (search) {
+        const pattern = `%${escapeLike(search)}%`;
+        conditions.push("(file_name LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')");
+        params.push(pattern, pattern);
+    }
+
+    // 渠道过滤（多选 OR，大小写不敏感）
+    if (channel.length > 0) {
+        conditions.push(`LOWER(COALESCE(channel, '')) IN (${channel.map(() => '?').join(',')})`);
+        params.push(...channel.map((c) => String(c).toLowerCase()));
+    }
+
+    // 列表类型过滤（White/Block/None）
+    if (listType.length > 0) {
+        const parts = listType.map((lt) => {
+            if (lt === 'None') {
+                return "(list_type IS NULL OR list_type = '' OR list_type = 'None')";
+            }
+            params.push(lt);
+            return 'list_type = ?';
+        });
+        conditions.push(`(${parts.join(' OR ')})`);
+    }
+
+    // 访问状态过滤（normal=非屏蔽, blocked=已屏蔽；白名单优先）
+    if (accessStatus.length > 0) {
+        const blockedCond = "COALESCE(list_type = 'Block' OR (label = 'adult' AND (list_type IS NULL OR list_type <> 'White')), 0)";
+        const parts = accessStatus.map((status) => {
+            if (status === 'normal') {
+                return `NOT ${blockedCond}`;
+            }
+            if (status === 'blocked') {
+                return blockedCond;
+            }
+            return '1 = 0';
+        });
+        conditions.push(`(${parts.join(' OR ')})`);
+    }
+
+    // 审查结果过滤（normal/teen/adult）
+    if (label.length > 0) {
+        const parts = label.map((lbl) => {
+            if (lbl === 'normal') {
+                return "(label IS NULL OR label = '' OR label = 'None' OR label = 'everyone')";
+            }
+            if (lbl === 'teen') {
+                return "label = 'teen'";
+            }
+            if (lbl === 'adult') {
+                return "label = 'adult'";
+            }
+            return '1 = 0';
+        });
+        conditions.push(`(${parts.join(' OR ')})`);
+    }
+
+    // 文件类型过滤（image/video/audio/other）
+    if (fileType.length > 0) {
+        const parts = fileType.map((ft) => {
+            if (ft === 'image') return "file_type LIKE 'image/%'";
+            if (ft === 'video') return "file_type LIKE 'video/%'";
+            if (ft === 'audio') return "file_type LIKE 'audio/%'";
+            if (ft === 'other') {
+                return "(file_type IS NULL OR (file_type NOT LIKE 'image/%' AND file_type NOT LIKE 'video/%' AND file_type NOT LIKE 'audio/%'))";
+            }
+            return '1 = 0';
+        });
+        conditions.push(`(${parts.join(' OR ')})`);
+    }
+
+    // 渠道名称过滤（支持 "type:name" 格式或单独名称）
+    if (channelName.length > 0) {
+        const parts = channelName.map((filterValue) => {
+            if (filterValue.includes(':')) {
+                const segments = filterValue.split(':');
+                params.push(segments[0], segments[1]);
+                return '(channel = ? AND channel_name = ?)';
+            }
+            params.push(filterValue);
+            return 'channel_name = ?';
+        });
+        conditions.push(`(${parts.join(' OR ')})`);
+    }
+
+    // 标签过滤（tags 列为 JSON 数组字符串，按精确标签匹配）
+    for (const tag of includeTags) {
+        if (!tag) continue;
+        conditions.push("tags LIKE ? ESCAPE '\\'");
+        params.push(`%"${escapeLike(String(tag).toLowerCase())}"%`);
+    }
+    for (const tag of excludeTags) {
+        if (!tag) continue;
+        conditions.push("(tags IS NULL OR tags NOT LIKE ? ESCAPE '\\')");
+        params.push(`%"${escapeLike(String(tag).toLowerCase())}"%`);
+    }
+
+    return { where: conditions.join(' AND '), params };
+}
+
+/**
+ * 构建目录范围条件
+ * @param {string} dirPrefix - 目录前缀（以 / 结尾，根目录为空字符串）
+ * @param {'recursive'|'direct'} mode - recursive 含子目录，direct 仅当前目录
+ */
+function buildD1DirectoryCond(dirPrefix, mode) {
+    if (dirPrefix === '') {
+        if (mode === 'direct') {
+            return { cond: "(directory IS NULL OR directory = '')", params: [] };
+        }
+        return { cond: '', params: [] };
+    }
+    if (mode === 'direct') {
+        return { cond: 'directory = ?', params: [dirPrefix] };
+    }
+    return { cond: "directory LIKE ? ESCAPE '\\'", params: [escapeLike(dirPrefix) + '%'] };
+}
+
+/**
+ * 查询当前目录的直接子目录（基于过滤后的记录）
+ */
+async function queryImmediateSubdirectoriesD1(context, filter, dirPrefix) {
+    let sql;
+    const params = [...filter.params];
+    if (dirPrefix === '') {
+        sql = `SELECT DISTINCT substr(directory, 1, instr(directory, '/')) AS d FROM files WHERE ${filter.where} AND directory IS NOT NULL AND directory <> ''`;
+    } else {
+        const prefixLength = dirPrefix.length;
+        sql = `SELECT DISTINCT substr(directory, 1, ${prefixLength} + instr(substr(directory, ${prefixLength + 1}), '/')) AS d FROM files WHERE ${filter.where} AND directory LIKE ? ESCAPE '\\'`;
+        params.push(escapeLike(dirPrefix) + '\\_%');
+    }
+    const rows = await d1All(context, sql, params);
+    return rows.map((row) => row.d).filter(Boolean);
+}
+
+/**
+ * D1 后端的 readIndex 实现：SQL 分页查询，返回结构与索引模式一致
+ */
+async function readIndexD1(context, options = {}) {
+    const {
+        search = '',
+        directory = '',
+        start = 0,
+        count = 50,
+        channel = [],
+        listType = [],
+        accessStatus = [],
+        label = [],
+        fileType = [],
+        channelName = [],
+        includeTags = [],
+        excludeTags = [],
+        countOnly = false,
+        includeSubdirFiles = false,
+        lite = false,
+    } = options;
+
+    const channelArr = Array.isArray(channel) ? channel : (channel ? [channel] : []);
+    const listTypeArr = Array.isArray(listType) ? listType : (listType ? [listType] : []);
+    const accessStatusArr = Array.isArray(accessStatus) ? accessStatus : (accessStatus ? [accessStatus] : []);
+    const labelArr = Array.isArray(label) ? label : (label ? [label] : []);
+    const fileTypeArr = Array.isArray(fileType) ? fileType : (fileType ? [fileType] : []);
+    const channelNameArr = Array.isArray(channelName) ? channelName : (channelName ? [channelName] : []);
+
+    const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
+
+    try {
+        const filter = buildD1FileFilter({
+            search,
+            channel: channelArr,
+            listType: listTypeArr,
+            accessStatus: accessStatusArr,
+            label: labelArr,
+            fileType: fileTypeArr,
+            channelName: channelNameArr,
+            includeTags,
+            excludeTags,
+        });
+
+        const recursiveDir = buildD1DirectoryCond(dirPrefix, 'recursive');
+        const directDir = buildD1DirectoryCond(dirPrefix, 'direct');
+
+        // 递归范围内的总数（与原索引实现的 totalCount 语义一致）
+        const countSql = `SELECT COUNT(*) AS c FROM files WHERE ${filter.where}${recursiveDir.cond ? ' AND ' + recursiveDir.cond : ''}`;
+        const countRow = await d1First(context, countSql, [...filter.params, ...recursiveDir.params]);
+        const totalCount = countRow?.c || 0;
+
+        if (countOnly) {
+            return {
+                totalCount,
+                indexLastUpdated: Date.now(),
+            };
+        }
+
+        // 当前目录直接文件数
+        const directCountSql = `SELECT COUNT(*) AS c FROM files WHERE ${filter.where} AND ${directDir.cond}`;
+        const directCountRow = await d1First(context, directCountSql, [...filter.params, ...directDir.params]);
+        const directFileCount = directCountRow?.c || 0;
+
+        // 分页数据（lite 模式仅查询必要字段，用于公开列表等全量场景）
+        const pageDir = includeSubdirFiles ? recursiveDir : directDir;
+        const selectColumns = lite
+            ? "id, json_extract(metadata, '$.FileType') AS FileType, json_extract(metadata, '$.TimeStamp') AS TimeStamp, json_extract(metadata, '$.FileSize') AS FileSize"
+            : 'id, metadata';
+        let pageSql = `SELECT ${selectColumns} FROM files WHERE ${filter.where}${pageDir.cond ? ' AND ' + pageDir.cond : ''} ORDER BY timestamp DESC, id DESC`;
+        const pageParams = [...filter.params, ...pageDir.params];
+        if (count !== -1) {
+            pageSql += ' LIMIT ? OFFSET ?';
+            pageParams.push(Math.max(1, count), Math.max(0, start));
+        } else if (lite) {
+            // 轻量全量列表设置安全上限，避免超出 D1 响应大小限制
+            pageSql += ' LIMIT 20000';
+        }
+        const rows = await d1All(context, pageSql, pageParams);
+
+        const files = lite
+            ? rows.map((row) => ({
+                id: row.id,
+                metadata: {
+                    FileType: row.FileType ?? undefined,
+                    TimeStamp: row.TimeStamp ?? undefined,
+                    FileSize: row.FileSize ?? undefined,
+                },
+            }))
+            : rows.map((row) => ({ id: row.id, metadata: parseMetadata(row.metadata) }));
+
+        // 当前目录的直接子目录
+        const directories = await queryImmediateSubdirectoriesD1(context, filter, dirPrefix);
+
+        return {
+            files,
+            directories,
+            totalCount,
+            directFileCount,
+            directFolderCount: directories.length,
+            indexLastUpdated: Date.now(),
+            returnedCount: files.length,
+            success: true,
+        };
+    } catch (error) {
+        console.error('Error reading index (D1 SQL):', error);
+        return {
+            files: [],
+            directories: [],
+            totalCount: 0,
+            indexLastUpdated: Date.now(),
+            returnedCount: 0,
+            success: false,
+        };
+    }
+}
+
+/**
+ * D1 后端的容量统计（实时 SQL 聚合，带短 TTL 缓存以降低读取量）
+ */
+let d1IndexMetaCache = { data: null, expiresAt: 0 };
+
+async function getIndexMetaD1(context) {
+    try {
+        const now = Date.now();
+        if (d1IndexMetaCache.data && now < d1IndexMetaCache.expiresAt) {
+            return d1IndexMetaCache.data;
+        }
+
+        const [totalRow, channelRows] = await Promise.all([
+            d1First(context, `SELECT COUNT(*) AS fileCount, SUM(CAST(file_size AS REAL)) AS usedMB FROM files WHERE ${D1_BASE_FILE_FILTER}`),
+            d1All(context, `SELECT channel_name, COUNT(*) AS fileCount, SUM(CAST(file_size AS REAL)) AS usedMB FROM files WHERE ${D1_BASE_FILE_FILTER} AND channel_name IS NOT NULL AND channel_name <> '' GROUP BY channel_name`),
+        ]);
+
+        const channelStats = {};
+        for (const row of channelRows) {
+            channelStats[row.channel_name] = {
+                usedMB: row.usedMB || 0,
+                fileCount: row.fileCount || 0,
+            };
+        }
+
+        const result = {
+            success: true,
+            totalCount: totalRow?.fileCount || 0,
+            totalSizeMB: Math.round((totalRow?.usedMB || 0) * 100) / 100,
+            channelStats,
+            lastUpdated: now,
+        };
+
+        d1IndexMetaCache = { data: result, expiresAt: now + 30 * 1000 };
+        return result;
+    } catch (error) {
+        console.error('Error getting index meta (D1 SQL):', error);
+        return {
+            success: false,
+            totalCount: 0,
+            totalSizeMB: 0,
+            channelStats: {},
+        };
+    }
+}
+
+/**
+ * D1 后端的上传趋势：按天/渠道聚合后在前端桶内汇总
+ */
+function buildTrendFromD1Rows(rows, options) {
+    const { timezoneOffset, maxPoints, seriesLimit } = options;
+
+    let newestDay = null;
+    let oldestDay = null;
+    for (const row of rows) {
+        const day = Number(row.day);
+        if (!Number.isFinite(day)) continue;
+        if (newestDay === null || day > newestDay) newestDay = day;
+        if (oldestDay === null || day < oldestDay) oldestDay = day;
+    }
+
+    const optionStartDay = parseTrendDate(options.startDate);
+    const optionEndDay = parseTrendDate(options.endDate);
+    let range = null;
+    if (optionStartDay !== null || optionEndDay !== null) {
+        const startDay = optionStartDay !== null ? optionStartDay : (oldestDay !== null ? oldestDay : optionEndDay);
+        const endDay = optionEndDay !== null ? optionEndDay : (newestDay !== null ? newestDay : optionStartDay);
+        range = startDay <= endDay ? { startDay, endDay } : { startDay: endDay, endDay: startDay };
+    } else if (newestDay !== null && oldestDay !== null) {
+        range = oldestDay > newestDay
+            ? { startDay: newestDay, endDay: oldestDay }
+            : { startDay: oldestDay, endDay: newestDay };
+    }
+
+    if (!range) {
+        return finalizeUploadTrend({ enabled: false, timezoneOffset, maxPoints, seriesLimit });
+    }
+
+    const spanDays = range.endDay - range.startDay + 1;
+    const bucketSizeDays = Math.max(1, Math.ceil(spanDays / maxPoints));
+    const bucketCount = Math.ceil(spanDays / bucketSizeDays);
+
+    const accumulator = {
+        enabled: true,
+        timezoneOffset,
+        maxPoints,
+        seriesLimit,
+        startDay: range.startDay,
+        endDay: range.endDay,
+        bucketSizeDays,
+        bucketCount,
+        labels: buildTrendBucketLabels(range.startDay, range.endDay, bucketSizeDays, bucketCount),
+        total: Array(bucketCount).fill(0),
+        channelGroups: new Map(),
+        channelNameGroups: new Map(),
+    };
+
+    for (const row of rows) {
+        const day = Number(row.day);
+        if (!Number.isFinite(day)) continue;
+        const bucketIndex = Math.floor((day - range.startDay) / bucketSizeDays);
+        if (bucketIndex < 0 || bucketIndex >= bucketCount) continue;
+        const count = Number(row.c) || 0;
+        accumulator.total[bucketIndex] += count;
+        addTrendGroupPoint(accumulator.channelGroups, row.ch, bucketIndex, count);
+        addTrendGroupPoint(accumulator.channelNameGroups, row.cname, bucketIndex, count);
+    }
+
+    return finalizeUploadTrend(accumulator);
+}
+
+/**
+ * D1 后端的索引信息（SQL 聚合统计，带短 TTL 缓存）
+ */
+let d1IndexInfoCache = { data: null, expiresAt: 0 };
+
+async function getIndexInfoD1(context, options = {}) {
+    try {
+        const now = Date.now();
+        if (d1IndexInfoCache.data && now < d1IndexInfoCache.expiresAt) {
+            return d1IndexInfoCache.data;
+        }
+
+        const channelCase = "CASE WHEN channel = 'TelegramNew' THEN 'Telegram' WHEN channel IS NULL OR channel = '' THEN 'Telegraph' ELSE channel END";
+
+        const [channelRows, directoryRows, typeRows, totalRow, newestRow, oldestRow, trendRows] = await Promise.all([
+            d1All(context, `SELECT ${channelCase} AS ch, COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER} GROUP BY ch`),
+            d1All(context, `SELECT CASE WHEN directory IS NOT NULL AND directory <> '' THEN directory ELSE '/' END AS d, COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER} GROUP BY d`),
+            d1All(context, `SELECT CASE WHEN label = 'adult' AND (list_type IS NULL OR list_type <> 'White') THEN 'Block' WHEN list_type IS NULL OR list_type = '' OR list_type = 'None' THEN 'None' ELSE list_type END AS t, COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER} GROUP BY t`),
+            d1First(context, `SELECT COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER}`),
+            d1First(context, `SELECT id, metadata FROM files WHERE ${D1_BASE_FILE_FILTER} ORDER BY timestamp DESC, id DESC LIMIT 1`),
+            d1First(context, `SELECT id, metadata FROM files WHERE ${D1_BASE_FILE_FILTER} ORDER BY timestamp ASC, id DESC LIMIT 1`),
+            d1All(context, `SELECT CAST((timestamp - ?) / 86400000 AS INTEGER) AS day, ${channelCase} AS ch, COALESCE(NULLIF(channel_name, ''), ${channelCase}) AS cname, COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER} GROUP BY day, ch, cname`, [normalizeInteger(options.timezoneOffset, 0, -14 * 60, 14 * 60) * 60 * 1000]),
+        ]);
+
+        const channelStats = {};
+        for (const row of channelRows) {
+            const key = normalizeTrendKey(row.ch);
+            channelStats[key] = (channelStats[key] || 0) + row.c;
+        }
+
+        const directoryStats = {};
+        for (const row of directoryRows) {
+            const key = normalizeTrendKey(row.d);
+            directoryStats[key] = (directoryStats[key] || 0) + row.c;
+        }
+
+        const typeStats = {};
+        for (const row of typeRows) {
+            const key = normalizeTrendKey(row.t);
+            typeStats[key] = (typeStats[key] || 0) + row.c;
+        }
+
+        const uploadTrend = buildTrendFromD1Rows(trendRows, {
+            timezoneOffset: normalizeInteger(options.timezoneOffset, 0, -14 * 60, 14 * 60),
+            maxPoints: normalizeInteger(options.maxPoints, DEFAULT_TREND_MAX_POINTS, 7, MAX_TREND_POINTS),
+            seriesLimit: normalizeInteger(options.seriesLimit, DEFAULT_TREND_SERIES_LIMIT, 1, MAX_TREND_SERIES_LIMIT),
+            startDate: options.startDate,
+            endDate: options.endDate,
+        });
+
+        const result = {
+            success: true,
+            totalFiles: totalRow?.c || 0,
+            lastUpdated: now,
+            channelStats,
+            directoryStats,
+            typeStats,
+            uploadTrend,
+            oldestFile: oldestRow ? { id: oldestRow.id, metadata: parseMetadata(oldestRow.metadata) } : undefined,
+            newestFile: newestRow ? { id: newestRow.id, metadata: parseMetadata(newestRow.metadata) } : undefined,
+        };
+
+        d1IndexInfoCache = { data: result, expiresAt: now + 60 * 1000 };
+        return result;
+    } catch (error) {
+        console.error('Error getting index info (D1 SQL):', error);
+        return null;
+    }
+}
+
+/**
+ * D1 后端的目录树（SQL DISTINCT 查询）
+ */
+async function getDirectoryTreeD1(context) {
+    const rows = await d1All(context, `SELECT DISTINCT directory FROM files WHERE directory IS NOT NULL AND directory <> '' AND timestamp IS NOT NULL AND substr(id, 1, 6) <> 'chunk_'`);
+    const directories = rows.map((row) => row.directory);
+    return buildTree(directories);
+}
+
+/**
+ * D1 后端的"重建索引"：无需重建，仅清理遗留的 JSON 索引与操作记录
+ */
+async function rebuildIndexD1(context) {
+    try {
+        const countRow = await d1First(context, `SELECT COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER}`);
+        const total = countRow?.c || 0;
+
+        await d1Run(context, "DELETE FROM settings WHERE key = 'manage@index@meta' OR key LIKE 'manage@index\\_%' ESCAPE '\\'");
+        await d1Run(context, 'DELETE FROM index_operations');
+
+        console.log(`D1 SQL mode: no index rebuild needed, ${total} files queryable directly.`);
+        return {
+            success: true,
+            processedCount: total,
+            indexedCount: total,
+        };
+    } catch (error) {
+        console.error('Error in D1 index cleanup:', error);
+        return {
+            success: false,
+            error: error.message,
+        };
+    }
+}
+
 /**
  * 添加文件到索引
  * @param {Object} context - 上下文对象，包含 env 和其他信息
@@ -65,6 +610,10 @@ export function getIndexChunkSize(env) {
  * @param {Object} metadata - 文件元数据
  */
 export async function addFileToIndex(context, fileId, metadata = null) {
+    // D1 后端：files 表即实时索引，无需记录原子操作
+    if (isD1Backend(context)) {
+        return { success: true, operationId: null };
+    }
     const { env } = context;
     const db = getDatabase(env);
 
@@ -99,6 +648,14 @@ export async function addFileToIndex(context, fileId, metadata = null) {
  */
 export async function batchAddFilesToIndex(context, files, options = {}) {
     try {
+        // D1 后端：files 表即实时索引，无需记录原子操作
+        if (isD1Backend(context)) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: files.length
+            };
+        }
         const { env } = context;
         const { skipExisting = false } = options;
         const db = getDatabase(env);
@@ -155,6 +712,10 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
  */
 export async function removeFileFromIndex(context, fileId) {
     try {
+        // D1 后端：files 表即实时索引，无需记录原子操作
+        if (isD1Backend(context)) {
+            return { success: true, operationId: null };
+        }
         // 记录删除操作
         const operationId = await recordOperation(context, 'remove', {
             fileId
@@ -175,6 +736,14 @@ export async function removeFileFromIndex(context, fileId) {
  */
 export async function batchRemoveFilesFromIndex(context, fileIds) {
     try {
+        // D1 后端：files 表即实时索引，无需记录原子操作
+        if (isD1Backend(context)) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: fileIds.length
+            };
+        }
         // 记录批量删除操作
         const operationId = await recordOperation(context, 'batch_remove', {
             fileIds
@@ -206,6 +775,10 @@ export async function batchRemoveFilesFromIndex(context, fileIds) {
  */
 export async function moveFileInIndex(context, originalFileId, newFileId, newMetadata = null) {
     try {
+        // D1 后端：files 表即实时索引，无需记录原子操作
+        if (isD1Backend(context)) {
+            return { success: true, operationId: null };
+        }
         const { env } = context;
         const db = getDatabase(env);
 
@@ -245,6 +818,14 @@ export async function moveFileInIndex(context, originalFileId, newFileId, newMet
  */
 export async function batchMoveFilesInIndex(context, moveOperations) {
     try {
+        // D1 后端：files 表即实时索引，无需记录原子操作
+        if (isD1Backend(context)) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: moveOperations.length
+            };
+        }
         const { env } = context;
         const db = getDatabase(env);
 
@@ -302,6 +883,14 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
  * @returns {Object} 合并结果
  */
 export async function mergeOperationsToIndex(context, options = {}) {
+    // D1 后端：无 JSON 索引，无需合并操作
+    if (isD1Backend(context)) {
+        return {
+            success: true,
+            processedOperations: 0,
+            message: 'No pending operations'
+        };
+    }
     const { request } = context;
     const { cleanupAfterMerge = true } = options;
     
@@ -487,6 +1076,10 @@ export async function mergeOperationsToIndex(context, options = {}) {
  * @param {boolean} options.includeSubdirFiles - 是否包含子目录下的文件
  */
 export async function readIndex(context, options = {}) {
+    // D1 后端：直接 SQL 查询 files 表，跳过 JSON 索引
+    if (isD1Backend(context)) {
+        return await readIndexD1(context, options);
+    }
     try {
         const {
             search = '',
@@ -766,6 +1359,10 @@ export async function readIndex(context, options = {}) {
  * @param {Function} progressCallback - 进度回调函数
  */
 export async function rebuildIndex(context, progressCallback = null) {
+    // D1 后端：无需重建索引，仅清理遗留数据
+    if (isD1Backend(context)) {
+        return await rebuildIndexD1(context);
+    }
     const { env, waitUntil } = context;
     const db = getDatabase(env);
 
@@ -864,6 +1461,10 @@ export async function rebuildIndex(context, progressCallback = null) {
  * @param {Object} options - 统计选项
  */
 export async function getIndexInfo(context, options = {}) {
+    // D1 后端：SQL 聚合统计
+    if (isD1Backend(context)) {
+        return await getIndexInfoD1(context, options);
+    }
     try {
         const index = await getIndex(context);
 
@@ -1105,7 +1706,7 @@ function addUploadTrendPoint(accumulator, metadata, channel) {
     addTrendGroupPoint(accumulator.channelNameGroups, channelName, bucketIndex);
 }
 
-function addTrendGroupPoint(groups, key, bucketIndex) {
+function addTrendGroupPoint(groups, key, bucketIndex, count = 1) {
     const normalizedKey = normalizeTrendKey(key);
     let entry = groups.get(normalizedKey);
     if (!entry) {
@@ -1116,8 +1717,8 @@ function addTrendGroupPoint(groups, key, bucketIndex) {
         groups.set(normalizedKey, entry);
     }
 
-    entry.total += 1;
-    entry.buckets.set(bucketIndex, (entry.buckets.get(bucketIndex) || 0) + 1);
+    entry.total += count;
+    entry.buckets.set(bucketIndex, (entry.buckets.get(bucketIndex) || 0) + count);
 }
 
 function buildTrendSeries(groups, bucketCount, seriesLimit) {
@@ -1253,6 +1854,10 @@ function finalizeUploadTrend(accumulator) {
  * @returns {Object} 索引元数据，包含 totalCount, totalSizeMB, channelStats 等
  */
 export async function getIndexMeta(context) {
+    // D1 后端：SQL 实时统计
+    if (isD1Backend(context)) {
+        return await getIndexMetaD1(context);
+    }
     const { env } = context;
     const db = getDatabase(env);
 
@@ -1594,6 +2199,22 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
  * @returns {Object} 删除结果 { success, deletedCount, errors?, totalFound? }
  */
 export async function deleteAllOperations(context) {
+    // D1 后端：一条 SQL 清空所有操作记录
+    if (isD1Backend(context)) {
+        try {
+            await d1Run(context, 'DELETE FROM index_operations');
+            console.log('D1 SQL mode: all operations deleted');
+            return {
+                success: true,
+                deletedCount: 0,
+                totalFound: 0,
+                message: 'No operations to delete'
+            };
+        } catch (error) {
+            console.error('Error deleting all operations (D1 SQL):', error);
+        }
+        return;
+    }
     const { request, env } = context;
     const db = getDatabase(env);
     
@@ -2102,6 +2723,20 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
  * @returns {Object} 存储统计信息
  */
 export async function getIndexStorageStats(context) {
+    // D1 后端：无分块索引，返回实时统计
+    if (isD1Backend(context)) {
+        const countRow = await d1First(context, `SELECT COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER}`).catch(() => null);
+        return {
+            success: true,
+            isChunked: false,
+            mode: 'd1-sql',
+            metadata: { totalCount: countRow?.c || 0 },
+            chunks: [],
+            totalChunks: 0,
+            existingChunks: 0,
+            totalSize: 0
+        };
+    }
     const { env } = context;
     const db = getDatabase(env);
 
@@ -2163,6 +2798,10 @@ export async function getIndexStorageStats(context) {
  * @returns {Object} 树形结构 { name, path, children }
  */
 export async function getDirectoryTree(context) {
+    // D1 后端：SQL 查询目录
+    if (isD1Backend(context)) {
+        return await getDirectoryTreeD1(context);
+    }
     // 1. 合并挂起操作
     await mergeOperationsToIndex(context);
 
@@ -2196,4 +2835,198 @@ export async function getDirectoryTree(context) {
     // 4. 构建树形结构
     const directories = Array.from(directorySet);
     return buildTree(directories);
+}
+
+/* ============= 随机文件 / 上传IP统计（D1 SQL 模式） ============= */
+
+/**
+ * 随机获取一个符合条件的文件记录
+ * D1 后端通过 SQL ORDER BY RANDOM() 直接选取，避免全量读取；
+ * KV 后端保留原有"全量读取 + JS 过滤"逻辑
+ * @param {Object} context - 上下文对象
+ * @param {Object} options - 查询选项
+ * @param {string} options.directory - 目录（不含尾部斜杠）
+ * @param {Array<string>} options.fileTypes - 文件类型关键字（如 ['image']）
+ * @param {string} options.orientation - 图片方向（landscape/portrait/square/空）
+ * @returns {Promise<{name: string, FileType: string, Width: number, Height: number}|null>}
+ */
+export async function queryRandomFile(context, options = {}) {
+    const { directory = '', fileTypes = [], orientation = '' } = options;
+    const dirPrefix = directory && !directory.endsWith('/') ? directory + '/' : directory;
+
+    if (isD1Backend(context)) {
+        try {
+            const filter = buildD1FileFilter({ accessStatus: ['normal'] });
+            const conditions = [filter.where];
+            const params = [...filter.params];
+
+            const recursiveDir = buildD1DirectoryCond(dirPrefix, 'recursive');
+            if (recursiveDir.cond) {
+                conditions.push(recursiveDir.cond);
+                params.push(...recursiveDir.params);
+            }
+
+            const fileTypesArr = Array.isArray(fileTypes) ? fileTypes.filter((t) => t) : [];
+            if (fileTypesArr.length > 0) {
+                const parts = fileTypesArr.map((type) => {
+                    params.push(`%${escapeLike(type)}%`);
+                    return "file_type LIKE ? ESCAPE '\\'";
+                });
+                conditions.push(`(${parts.join(' OR ')})`);
+            }
+
+            const widthExpr = "CAST(json_extract(metadata, '$.Width') AS REAL)";
+            const heightExpr = "CAST(json_extract(metadata, '$.Height') AS REAL)";
+            if (orientation === 'landscape') {
+                conditions.push(`(${widthExpr} > ${heightExpr} * 1.1)`);
+            } else if (orientation === 'portrait') {
+                conditions.push(`(${widthExpr} < ${heightExpr} * 0.9)`);
+            } else if (orientation === 'square') {
+                conditions.push(`(${widthExpr} >= ${heightExpr} * 0.9 AND ${widthExpr} <= ${heightExpr} * 1.1)`);
+            }
+
+            const row = await d1First(
+                context,
+                `SELECT id AS name, json_extract(metadata, '$.FileType') AS FileType, json_extract(metadata, '$.Width') AS Width, json_extract(metadata, '$.Height') AS Height FROM files WHERE ${conditions.join(' AND ')} ORDER BY RANDOM() LIMIT 1`,
+                params
+            );
+            return row || null;
+        } catch (error) {
+            console.error('Error querying random file (D1 SQL):', error);
+            return null;
+        }
+    }
+
+    // KV 后端：保留原有逻辑（全量读取 + JS 过滤）
+    const result = await readIndex(context, { directory, count: -1, includeSubdirFiles: true, accessStatus: 'normal' });
+    let records = result.files || [];
+
+    const fileTypesArr = Array.isArray(fileTypes) ? fileTypes.filter((t) => t) : [];
+    if (fileTypesArr.length > 0) {
+        records = records.filter((item) => fileTypesArr.some((type) => item.metadata?.FileType?.includes(type)));
+    }
+
+    if (orientation && records.length > 0) {
+        const SQUARE_THRESHOLD = 0.1;
+        records = records.filter((item) => {
+            if (!item.metadata?.Width || !item.metadata?.Height) return false;
+            const ratio = item.metadata.Width / item.metadata.Height;
+            switch (orientation) {
+                case 'landscape':
+                    return ratio > (1 + SQUARE_THRESHOLD);
+                case 'portrait':
+                    return ratio < (1 - SQUARE_THRESHOLD);
+                case 'square':
+                    return ratio >= (1 - SQUARE_THRESHOLD) && ratio <= (1 + SQUARE_THRESHOLD);
+                default:
+                    return true;
+            }
+        });
+    }
+
+    if (records.length === 0) {
+        return null;
+    }
+
+    const picked = records[Math.floor(Math.random() * records.length)];
+    return {
+        name: picked.id,
+        FileType: picked.metadata?.FileType,
+        Width: picked.metadata?.Width,
+        Height: picked.metadata?.Height,
+    };
+}
+
+/**
+ * 按上传 IP 统计文件数量（管理端 IP 统计列表）
+ * @param {Object} context - 上下文对象
+ * @param {number} start - 分页起始位置
+ * @param {number} count - 返回数量
+ * @returns {Promise<Array<{ip: string, address: string, count: number}>>}
+ */
+export async function listUploadIPStats(context, start = 0, count = 10) {
+    start = Math.max(0, start);
+    count = Math.max(1, count);
+
+    if (isD1Backend(context)) {
+        try {
+            return await d1All(
+                context,
+                `SELECT upload_ip AS ip, COALESCE(NULLIF(upload_address, ''), '未知') AS address, COUNT(*) AS count FROM files WHERE ${D1_BASE_FILE_FILTER} AND upload_ip IS NOT NULL AND upload_ip <> '' GROUP BY upload_ip ORDER BY count DESC, ip LIMIT ? OFFSET ?`,
+                [count, start]
+            );
+        } catch (error) {
+            console.error('Error listing upload IP stats (D1 SQL):', error);
+            return [];
+        }
+    }
+
+    // KV 后端：保留原有逻辑
+    const allRecords = await readIndex(context, { count: -1, includeSubdirFiles: true });
+    const groups = new Map();
+    for (const item of allRecords.files || []) {
+        const ip = item.metadata?.UploadIP;
+        if (!ip) continue;
+
+        const group = groups.get(ip);
+        if (group) {
+            group.count++;
+            continue;
+        }
+
+        groups.set(ip, {
+            ip,
+            address: item.metadata?.UploadAddress || '未知',
+            count: 1,
+        });
+    }
+
+    return Array.from(groups.values())
+        .sort((a, b) => b.count - a.count)
+        .slice(start, start + count);
+}
+
+/**
+ * 按上传 IP 查询文件列表（管理端 IP 统计详情）
+ * @param {Object} context - 上下文对象
+ * @param {string} ip - 上传 IP
+ * @param {number} start - 分页起始位置
+ * @param {number} count - 返回数量
+ * @returns {Promise<{files: Array<{id: string, metadata: Object}>, total: number}>}
+ */
+export async function listFilesByUploadIP(context, ip, start = 0, count = 20) {
+    start = Math.max(0, start);
+    count = Math.max(1, count);
+
+    if (isD1Backend(context)) {
+        try {
+            const [rows, totalRow] = await Promise.all([
+                d1All(
+                    context,
+                    `SELECT id, metadata FROM files WHERE ${D1_BASE_FILE_FILTER} AND upload_ip = ? ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`,
+                    [ip, count, start]
+                ),
+                d1First(
+                    context,
+                    `SELECT COUNT(*) AS c FROM files WHERE ${D1_BASE_FILE_FILTER} AND upload_ip = ?`,
+                    [ip]
+                ),
+            ]);
+            return {
+                files: rows.map((row) => ({ id: row.id, metadata: parseMetadata(row.metadata) })),
+                total: totalRow?.c || 0,
+            };
+        } catch (error) {
+            console.error('Error listing files by upload IP (D1 SQL):', error);
+            return { files: [], total: 0 };
+        }
+    }
+
+    // KV 后端：保留原有逻辑
+    const allRecords = await readIndex(context, { count: -1, includeSubdirFiles: true });
+    const matching = (allRecords.files || []).filter((item) => item.metadata?.UploadIP === ip);
+    return {
+        files: matching.slice(start, start + count),
+        total: matching.length,
+    };
 }

@@ -73,13 +73,14 @@ async function getPublicFileList(context, url, dir, recursive) {
         return data;
     }
 
-    // 读取文件列表
+    // 读取文件列表（lite 模式仅查询必要字段，避免全量解析 metadata）
     const result = await readIndex(context, {
         directory: dir,
         start: 0,
         count: -1,
         includeSubdirFiles: recursive,
         accessStatus: 'normal', // 只返回正常可访问的内容
+        lite: true,
     });
 
     if (!result.success) {
